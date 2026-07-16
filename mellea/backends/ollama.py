@@ -3,6 +3,7 @@
 import asyncio
 import datetime
 import functools
+import json as _json
 from collections.abc import AsyncIterator, Coroutine, Sequence
 from typing import Any
 
@@ -26,21 +27,136 @@ from ..core import (
     RawProviderResponse,
 )
 from ..core.base import AbstractMelleaTool
-from ..formatters import ChatFormatter, TemplateFormatter
+from ..formatters import ChatFormatter, TemplateFormatter, granite as granite_formatters
+from ..formatters.granite.base.types import (
+    AssistantMessage,
+    ChatCompletionResponse,
+    ChatCompletionResponseChoice,
+)
 from ..helpers import (
     DEFAULT_CHUNK_TIMEOUT,
     ClientCache,
     get_current_event_loop,
+    message_to_openai_message,
+    messages_to_docs,
     send_to_queue,
 )
-from ..stdlib.components import Message
+from ..stdlib.components import Intrinsic, Message
 from ..stdlib.requirements import ALoraRequirement
 from ..telemetry.context import generate_request_id, with_context
+from .adapters import AdapterMixin, AdapterType, IntrinsicAdapter
 from .backend import FormatterBackend
 from .model_options import ModelOption
-from .tools import add_tools_from_context_actions, add_tools_from_model_options
+from .tools import (
+    add_tools_from_context_actions,
+    add_tools_from_model_options,
+    convert_tools_to_json,
+)
 
 format: None = None  # typing this variable in order to shadow the global format function and ensure mypy checks for errors
+
+# Maps the mellea intrinsic catalog name to the conventional Ollama model
+# name prefix used for the merged aLoRA/LoRA models distributed by IBM.
+# Tag suffix (e.g. ":8b") is derived automatically from the base model at runtime.
+# Users can override the full tag via add_adapter(..., ollama_model="...") when
+# their local Ollama naming differs from this convention.
+# TODO: add remaining intrinsics once their Ollama model names are confirmed
+_INTRINSIC_OLLAMA_PREFIX: dict[str, str] = {
+    "uncertainty": "granite-uncertainty",
+    "requirement-check": "granite-requirement-check",
+    "context-attribution": "granite-context-attribution",
+}
+
+
+def _apply_transforms_no_logprobs(raw_json: str, transforms: list[dict]) -> str:
+    """Apply io.yaml output transformations to a raw JSON string without logprobs.
+
+    The ``likelihood`` transformation normally requires token logprobs to compute
+    a weighted-average float score.  Ollama does not expose logprobs for its
+    merged intrinsic models, so this function substitutes a direct lookup from
+    the rule's ``categories_to_values`` mapping, which is sufficient for all
+    current Granite intrinsics (categorical ``"yes"``/``"no"`` or ``"0"``-``"9"``
+    outputs that map to fixed floats).
+
+    Structural transforms (``nest``, ``project``) are applied by manipulating the
+    parsed dict directly.  Unknown transform types are skipped with a warning.
+
+    Args:
+        raw_json: Raw JSON string from the Ollama model (e.g. ``'{"score":"yes"}'``).
+        transforms: List of transformation dicts from the io.yaml ``transformations``
+            block.
+
+    Returns:
+        Transformed JSON string ready to be consumed by ``output_to_bool``.
+    """
+    if not raw_json.strip():
+        return raw_json
+
+    try:
+        data: Any = _json.loads(raw_json)
+    except _json.JSONDecodeError:
+        return raw_json  # pass through; upstream will raise a cleaner error
+
+    for rule in transforms:
+        rule_type = rule.get("type")
+        input_path: list = rule.get("input_path", [])
+
+        if rule_type == "likelihood":
+            # Direct lookup: replace the categorical token string with its float value.
+            ctv: dict | None = rule.get("categories_to_values")
+            if ctv is None:
+                continue
+            # Navigate to the parent and replace the leaf value.
+            obj = data
+            for key in input_path[:-1]:
+                obj = obj[key]
+            leaf_key = input_path[-1] if input_path else None
+            if leaf_key is not None:
+                raw_val = str(obj[leaf_key])
+                obj[leaf_key] = ctv.get(raw_val, 0.0)
+            else:
+                # input_path == [] means the whole object is the value — unusual.
+                raw_val = str(data)
+                data = ctv.get(raw_val, 0.0)
+
+        elif rule_type == "nest":
+            field_name: str = rule["field_name"]
+            obj = data
+            for key in input_path[:-1]:
+                obj = obj[key]
+            if input_path:
+                leaf_key = input_path[-1]
+                obj[leaf_key] = {field_name: obj[leaf_key]}
+            else:
+                data = {field_name: data}
+
+        elif rule_type == "project":
+            retained: dict | list = rule["retained_fields"]
+            if isinstance(retained, list):
+                retained = {f: f for f in retained}
+            obj = data
+            for key in input_path[:-1]:
+                obj = obj[key]
+            if input_path:
+                leaf_key = input_path[-1]
+                src = obj[leaf_key]
+                if isinstance(src, dict):
+                    obj[leaf_key] = {retained[k]: src.get(k) for k in retained}
+                elif isinstance(src, list):
+                    obj[leaf_key] = [
+                        {retained[k]: item.get(k) for k in retained} for item in src
+                    ]
+            else:
+                if isinstance(data, dict):
+                    data = {retained[k]: data.get(k) for k in retained}
+
+        else:
+            MelleaLogger.get_logger().debug(
+                "_apply_transforms_no_logprobs: skipping unsupported transform type %r",
+                rule_type,
+            )
+
+    return _json.dumps(data)
 
 
 def _strip_data_uri_prefix(images: list[str]) -> list[str]:
@@ -57,14 +173,13 @@ def _strip_data_uri_prefix(images: list[str]) -> list[str]:
     """
     stripped = []
     for img in images:
-        # Check if the string has a data URI prefix and remove it
         if "data:" in img and "base64," in img:
             img = img.split("base64,")[1]
         stripped.append(img)
     return stripped
 
 
-class OllamaModelBackend(FormatterBackend):
+class OllamaModelBackend(FormatterBackend, AdapterMixin):
     """A model that uses the Ollama Python SDK for local inference.
 
     Args:
@@ -125,6 +240,15 @@ class OllamaModelBackend(FormatterBackend):
         self._model_id: str = ollama_model_id
         self._provider: str = "ollama"
 
+        # Registry for adapters registered via add_adapter; required by AdapterMixin._find_adapter.
+        self._added_adapters: dict[str, IntrinsicAdapter] = {}
+
+        # Maps intrinsic_name → resolved Ollama model tag for that intrinsic.
+        # Populated by add_adapter(); consulted by _generate_from_intrinsic().
+        # Derived automatically from _INTRINSIC_OLLAMA_PREFIX + base model size tag,
+        # or set explicitly via add_adapter(..., ollama_model="...").
+        self._intrinsic_model_map: dict[str, str] = {}
+
         # Setup the client and ensure that we have the model available.
         self._base_url = base_url
         self._timeout = timeout
@@ -153,7 +277,6 @@ class OllamaModelBackend(FormatterBackend):
             raise OSError(err)
 
         # A mapping of common options for this backend mapped to their Mellea ModelOptions equivalent.
-        # These are usually values that must be extracted before hand or that are common among backend providers.
         self.to_mellea_model_opts_map = {
             "system": ModelOption.SYSTEM_PROMPT,
             "think": ModelOption.THINKING,
@@ -166,16 +289,141 @@ class OllamaModelBackend(FormatterBackend):
         }
 
         # A mapping of Mellea specific ModelOptions to the specific names for this backend.
-        # These options should almost always be a subset of those specified in the `to_mellea_model_opts_map`.
-        # Usually, values that are intentionally extracted while prepping for the backend generate call
-        # will be omitted here so that they will be removed when model_options are processed
-        # for the call to the model.
         self.from_mellea_model_opts_map = {
             ModelOption.CONTEXT_WINDOW: "num_ctx",
             ModelOption.MAX_NEW_TOKENS: "num_predict",
             ModelOption.SEED: "seed",
             ModelOption.STOP_SEQUENCES: "stop",
         }
+
+    # ------------------------------------------------------------------
+    # AdapterMixin implementation
+    # ------------------------------------------------------------------
+
+    @property
+    def base_model_name(self) -> str:
+        """Return the short model name used for adapter catalog lookup.
+
+        Strips an ``org/`` prefix if present, mirroring the convention used by
+        ``OpenAIBackend``. For example, ``"ibm-granite/granite-3.3-8b-instruct"``
+        returns ``"granite-3.3-8b-instruct"``, while a plain tag such as
+        ``"granite3.3:8b"`` is returned unchanged.
+
+        Returns:
+            str: The short model name.
+        """
+        if "/" in self._model_id:
+            return self._model_id.split("/")[1]
+        return self._model_id
+
+    def add_adapter(
+        self, adapter: IntrinsicAdapter, *, ollama_model: str | None = None
+    ) -> None:
+        """Register an adapter with this backend.
+
+        Ollama does not support hot-loading PEFT adapter weights at runtime.
+        This method records the adapter's I/O config (needed for
+        ``call_intrinsic`` prompt formatting) and resolves which Ollama model
+        tag should be used to serve that intrinsic.
+
+        The target Ollama model is resolved in this order:
+
+        1. ``ollama_model`` — use exactly as given when provided.
+        2. Auto-derive from ``_INTRINSIC_OLLAMA_PREFIX`` + size tag extracted
+           from ``self._model_id``.  For example, a backend running
+           ``"granite4.1:8b"`` will map ``"uncertainty"`` →
+           ``"granite-uncertainty:8b"`` automatically.
+        3. Fall back to ``self._model_id`` (the base model) at call time if
+           neither of the above yields a result.  A warning is logged so the
+           mismatch is visible.
+
+        Args:
+            adapter (IntrinsicAdapter): The adapter to register.
+            ollama_model (str | None): Explicit Ollama model tag for this
+                intrinsic (e.g. ``"granite-uncertainty:8b"``).  Pass this when
+                your local Ollama naming differs from the IBM convention.
+                Defaults to ``None`` (auto-derive).
+
+        Raises:
+            TypeError: If ``adapter`` is not an ``IntrinsicAdapter``.
+            Exception: If ``adapter`` is already registered with a different backend.
+        """
+        if not isinstance(adapter, IntrinsicAdapter):
+            raise TypeError(
+                f"OllamaModelBackend only accepts IntrinsicAdapter. Got: {type(adapter).__name__}. "
+                "Use LocalHFBackend for full PEFT adapter weight loading."
+            )
+        if adapter.backend is not None and adapter.backend is not self:
+            raise Exception(
+                f"adapter {adapter.name!r} has already been added to a different backend: {adapter.backend}"
+            )
+        if adapter.qualified_name in self._added_adapters:
+            MelleaLogger.get_logger().warning(
+                "Adapter %r is already registered with this backend; skipping duplicate add_adapter call.",
+                adapter.qualified_name,
+            )
+            return
+        adapter.backend = self
+        self._added_adapters[adapter.qualified_name] = adapter
+
+        # Resolve and store the Ollama model tag for this intrinsic.
+        if ollama_model is not None:
+            resolved = ollama_model
+        else:
+            # Auto-derive: prefix from the catalog map + size tag from self._model_id.
+            prefix = _INTRINSIC_OLLAMA_PREFIX.get(adapter.intrinsic_name)
+            size = self._model_id.split(":")[-1] if ":" in self._model_id else None
+            if prefix and size:
+                resolved = f"{prefix}:{size}"
+            else:
+                resolved = None  # will fall back to self._model_id at call time
+
+        if resolved is not None:
+            self._intrinsic_model_map[adapter.intrinsic_name] = resolved
+            MelleaLogger.get_logger().debug(
+                "Adapter %r will route intrinsic calls to Ollama model %r.",
+                adapter.intrinsic_name,
+                resolved,
+            )
+        else:
+            MelleaLogger.get_logger().warning(
+                "Could not resolve an Ollama model tag for intrinsic %r "
+                "(base model %r has no ':tag' suffix and no ollama_model= was given). "
+                "Intrinsic calls will fall back to the base model, which will likely "
+                "produce incorrect output. Pass ollama_model= explicitly to fix this.",
+                adapter.intrinsic_name,
+                self._model_id,
+            )
+
+    def load_adapter(self, adapter_qualified_name: str) -> None:
+        """No-op for Ollama — adapter weights are pre-merged into the model.
+
+        Args:
+            adapter_qualified_name (str): Qualified name of the adapter to load.
+        """
+        MelleaLogger.get_logger().debug(
+            "load_adapter(%r) is a no-op for OllamaModelBackend.",
+            adapter_qualified_name,
+        )
+
+    def unload_adapter(self, adapter_qualified_name: str) -> None:
+        """No-op for Ollama — there are no adapter weights to unload.
+
+        Args:
+            adapter_qualified_name (str): Qualified name of the adapter to unload.
+        """
+        MelleaLogger.get_logger().debug(
+            "unload_adapter(%r) is a no-op for OllamaModelBackend.",
+            adapter_qualified_name,
+        )
+
+    def list_adapters(self) -> list[str]:
+        """Return the qualified names of all registered adapters.
+
+        Returns:
+            list[str]: Qualified adapter names registered via ``add_adapter``.
+        """
+        return list(self._added_adapters.keys())
 
     def _check_ollama_server(self) -> bool:
         """Requests generic info about the Ollama server to ensure it's running."""
@@ -209,7 +457,6 @@ class OllamaModelBackend(FormatterBackend):
 
         This code was generated by ChatGPT.
         """
-        # shortcut --  if model is in list-- don't try to pull
         if self.is_model_available(self._model_id):
             return True
 
@@ -224,7 +471,6 @@ class OllamaModelBackend(FormatterBackend):
                 digest = update.digest
                 completed = update.completed or 0
                 total = update.total or 0
-                # Only track digests with a known total
                 if digest and total > 0:
                     if digest not in progress_bars:
                         progress_bars[digest] = tqdm(
@@ -238,7 +484,6 @@ class OllamaModelBackend(FormatterBackend):
                     delta = completed - pbar.n
                     if delta > 0:
                         pbar.update(delta)
-            # Close all progress bars
             for pbar in progress_bars.values():
                 pbar.close()
             return True
@@ -315,6 +560,194 @@ class OllamaModelBackend(FormatterBackend):
         )
         return ModelOption.remove_special_keys(backend_specific)
 
+    async def _generate_from_intrinsic(
+        self,
+        action: Intrinsic,
+        ctx: Context,
+        *,
+        model_options: dict | None = None,
+        tool_calls: bool = False,
+    ) -> ModelOutputThunk:
+        """Generate a completion for an ``Intrinsic`` action via the Ollama chat API.
+
+        Uses ``IntrinsicsRewriter`` (from the adapter's ``io.yaml``) to inject the
+        control token / instruction message that activates structured output in the
+        pre-merged Ollama intrinsic model.  The raw JSON the model emits is returned
+        directly — e.g. ``{"score": "9"}`` for uncertainty or
+        ``{"score": "yes"/"no"}`` for requirement-check.
+
+        Args:
+            action (Intrinsic): The intrinsic component to execute.
+            ctx (Context): The current generation context (must be a chat context).
+            model_options (dict | None): Per-call model options that override defaults.
+            tool_calls (bool): If ``True``, expose available tools to the model.
+
+        Returns:
+            ModelOutputThunk: Thunk containing the raw JSON string from the model.
+
+        Raises:
+            ValueError: If no adapter is registered for the requested intrinsic.
+            TypeError: If the registered adapter is not an ``IntrinsicAdapter``.
+            NotImplementedError: If streaming is requested.
+        """
+        assert ctx.is_chat_context, "OllamaModelBackend only supports chat contexts."
+
+        model_opts = self._simplify_and_merge(model_options)
+
+        if model_opts.get(ModelOption.STREAM, False):
+            raise NotImplementedError("Intrinsics do not support streaming.")
+
+        # ── Collect tools ────────────────────────────────────────────────────
+        tools: dict[str, AbstractMelleaTool] = {}
+        if tool_calls:
+            add_tools_from_model_options(tools, model_opts)
+            add_tools_from_context_actions(tools, ctx.actions_for_available_tools())
+
+        # ── Build the base conversation dict ─────────────────────────────────
+        linearized_ctx = ctx.view_for_generation()
+        assert linearized_ctx is not None
+        ctx_as_messages: list[Message] = self.formatter.to_chat_messages(linearized_ctx)
+
+        system_prompt = model_opts.get(ModelOption.SYSTEM_PROMPT, "")
+        conversation: list[dict] = []
+        if system_prompt != "":
+            conversation.append({"role": "system", "content": system_prompt})
+        conversation.extend([message_to_openai_message(m) for m in ctx_as_messages])
+
+        # Extract documents attached to context messages (needed for context-attribution).
+        docs = messages_to_docs(ctx_as_messages)
+
+        # ── Find the registered adapter ──────────────────────────────────────
+        allowed_types = tuple(at.value for at in action.adapter_types)
+        adapter = self._find_adapter(action.intrinsic_name, allowed_types)
+        if adapter is None:
+            raise ValueError(
+                f"OllamaModelBackend has no adapter registered for intrinsic "
+                f"{action.intrinsic_name!r}. Pre-register it via add_adapter() "
+                f"before calling call_intrinsic()."
+            )
+        if not isinstance(adapter, IntrinsicAdapter):
+            raise TypeError(
+                f"OllamaModelBackend only supports IntrinsicAdapter; "
+                f"got {type(adapter).__name__!r}."
+            )
+
+        # ── Apply io.yaml prompt rewriting ───────────────────────────────────
+        rewriter = granite_formatters.IntrinsicsRewriter(
+            config_dict=adapter.config, model_name=adapter.name
+        )
+
+        formatted_tools = [t["function"] for t in convert_tools_to_json(tools)]
+        request_json: dict = {
+            "messages": conversation,
+            "extra_body": {"documents": docs},
+            "tools": formatted_tools if formatted_tools else None,
+        }
+        rewritten = rewriter.transform(request_json, **action.intrinsic_kwargs)
+
+        # Apply any user-supplied temperature override.
+        temperature = model_opts.get(ModelOption.TEMPERATURE, None)
+        if temperature is not None:
+            rewritten = rewritten.model_copy(update={"temperature": temperature})
+
+        # Extract max_tokens from rewritten request (from io.yaml parameters).
+        rewritten_params = rewritten.model_dump(exclude_none=True)
+        num_predict = rewritten_params.get(
+            "max_completion_tokens", model_opts.get(ModelOption.MAX_NEW_TOKENS, 15)
+        )
+
+        # ── Resolve the Ollama model to call ─────────────────────────────────
+        ollama_model_tag = self._intrinsic_model_map.get(
+            action.intrinsic_name, self._model_id
+        )
+
+        # ── Send to Ollama ────────────────────────────────────────────────────
+        ollama_messages = [m.model_dump(exclude_none=True) for m in rewritten.messages]
+
+        # Pass the io.yaml response_format schema as Ollama's `format` parameter
+        # to engage constrained decoding and guarantee valid JSON output.
+        _raw_fmt = adapter.config.get("response_format")
+        if isinstance(_raw_fmt, str):
+            response_format_schema: dict | None = _json.loads(_raw_fmt)
+        else:
+            response_format_schema = _raw_fmt  # already a dict or None
+
+        raw_response: ollama.ChatResponse = await self._async_client.chat(
+            model=ollama_model_tag,
+            messages=ollama_messages,
+            options={"temperature": temperature or 0.0, "num_predict": num_predict},
+            format=response_format_schema,
+            stream=False,
+        )
+
+        raw_content: str = raw_response.message.content or ""
+        if not raw_content.strip():
+            MelleaLogger.get_logger().warning(
+                "Intrinsic '%s' via Ollama model '%s' returned an empty response. "
+                "Verify that the model is available locally ('ollama list') and is "
+                "the correct intrinsic model for this capability.",
+                action.intrinsic_name,
+                ollama_model_tag,
+            )
+
+        # Apply the io.yaml output transformations.
+        #
+        # Two-phase strategy:
+        # 1. `_apply_transforms_no_logprobs` handles `likelihood` rules by
+        #    direct categories_to_values lookup (Ollama provides no logprobs).
+        #    It also handles simple structural rules (nest, project) and skips
+        #    complex ones (decode_sentences, explode, drop_duplicates) that
+        #    need the ChatCompletion request object.
+        # 2. `IntrinsicsResultProcessor` then runs the full transform chain
+        #    (including decode_sentences) using the rewritten ChatCompletion
+        #    as context.  It re-reads its own config, so any rule already
+        #    applied in phase 1 will be a no-op on the already-transformed
+        #    JSON (likelihood is now a float, not a string token; nest/project
+        #    have already restructured the dict).
+        #
+        # For simple intrinsics (uncertainty, requirement-check) that have no
+        # decode_sentences rules, phase 2 is a near-no-op: likelihood sees a
+        # float value that doesn't match any category string and returns 0.0.
+        # To avoid double-applying likelihood, we only run phase 2 when the
+        # config has transforms that _apply_transforms_no_logprobs skips.
+        transforms = adapter.config.get("transformations") or []
+        skipped_types = {"explode", "drop_duplicates", "decode_sentences"}
+        needs_processor = any(r.get("type") in skipped_types for r in transforms)
+
+        pre_content = _apply_transforms_no_logprobs(raw_content, transforms)
+
+        if needs_processor:
+            processor = granite_formatters.IntrinsicsResultProcessor(
+                config_dict=adapter.config
+            )
+            synthetic_response = ChatCompletionResponse(
+                choices=[
+                    ChatCompletionResponseChoice(
+                        index=0,
+                        message=AssistantMessage(content=pre_content),
+                        finish_reason="stop",
+                    )
+                ]
+            )
+            transformed_response = processor.transform(synthetic_response, rewritten)
+            processed_content = transformed_response.choices[0].message.content or ""
+        else:
+            processed_content = pre_content
+
+        mot = ModelOutputThunk(value=processed_content)
+        mot.generation.model = ollama_model_tag
+        mot.generation.provider = self._provider
+
+        generate_log = GenerateLog()
+        generate_log.backend = f"ollama::{ollama_model_tag}"
+        generate_log.date = datetime.datetime.now()
+        generate_log.model_options = model_opts
+        generate_log.model_output = processed_content
+        generate_log.action = action
+        mot._generate_log = generate_log
+
+        return mot
+
     async def _generate_from_context(
         self,
         action: Component[C] | CBlock | ModelOutputThunk,
@@ -326,7 +759,10 @@ class OllamaModelBackend(FormatterBackend):
     ) -> tuple[ModelOutputThunk[C], Context]:
         """Generate a completion for ``action`` given ``ctx`` via the Ollama chat API.
 
-        Delegates to ``generate_from_chat_context``. Only chat contexts are supported.
+        Routes ``Intrinsic`` and ``ALoraRequirement`` actions to
+        ``_generate_from_intrinsic`` so that io.yaml prompt rewriting and output
+        post-processing are applied. All other actions are forwarded to
+        ``generate_from_chat_context``.
 
         Args:
             action (Component[C] | CBlock): The component or content block to generate
@@ -349,6 +785,22 @@ class OllamaModelBackend(FormatterBackend):
 
         _model_id_str = str(getattr(self, "model_id", "unknown"))
         with with_context(request_id=generate_request_id(), model_id=_model_id_str):
+            model_opts = self._simplify_and_merge(model_options)
+
+            # ALoraRequirement is a subclass of both Requirement and Intrinsic,
+            # so this branch must come first.
+            if isinstance(action, ALoraRequirement):
+                mot = await self._generate_from_intrinsic(
+                    action, ctx, model_options=model_opts, tool_calls=tool_calls
+                )
+                return mot, ctx.add(action).add(mot)
+
+            if isinstance(action, Intrinsic):
+                mot = await self._generate_from_intrinsic(
+                    action, ctx, model_options=model_opts, tool_calls=tool_calls
+                )
+                return mot, ctx.add(action).add(mot)
+
             mot = await self.generate_from_chat_context(
                 action,
                 ctx,
@@ -393,7 +845,6 @@ class OllamaModelBackend(FormatterBackend):
             ValueError: If a message contains an ``AudioBlock`` or ``AudioUrlBlock``;
                 Ollama does not support audio input.
         """
-        # Start by awaiting any necessary computation.
         await self.do_generate_walk(action)
 
         model_opts = self._simplify_and_merge(model_options)
@@ -402,26 +853,14 @@ class OllamaModelBackend(FormatterBackend):
         assert linearized_context is not None, (
             "Cannot generate from a non-linear context in a FormatterBackend."
         )
-        # Convert our linearized context into a sequence of chat messages. Template formatters have a standard way of doing this.
         messages: list[Message] = self.formatter.to_chat_messages(linearized_context)
-        # Add the final message.
-        match action:
-            case ALoraRequirement():
-                raise Exception(
-                    "The ollama backend does not currently support aLoRA adapters."
-                )
-            case _:
-                messages.extend(self.formatter.to_chat_messages([action]))
-        # construct the conversation from our messages, adding a system prompt at the first message if one was provided.
+        messages.extend(self.formatter.to_chat_messages([action]))
+
         conversation: list[dict] = []
-        # We use system prompt None/empty-string semantics in a way that is consistent with Hugging Face and other libraries.
-        # If the system prompt is None, the the default system prompt gets used.
         system_prompt = model_opts.get(ModelOption.SYSTEM_PROMPT, "")
         if system_prompt != "":
             conversation.append({"role": "system", "content": system_prompt})
 
-        # NOTE: `self.formatter.to_chat_messages` explicitly skips `Message` objects. However, we need
-        # to print `Message`s to correctly serialize any documents with the message. Do the printing here.
         for m in messages:
             if m.images is not None:
                 for img in m.images:
@@ -447,7 +886,6 @@ class OllamaModelBackend(FormatterBackend):
                 }
             )
 
-        # Append tool call information if applicable.
         tools: dict[str, AbstractMelleaTool] = dict()
         if tool_calls:
             if _format:
@@ -457,16 +895,12 @@ class OllamaModelBackend(FormatterBackend):
             else:
                 add_tools_from_model_options(tools, model_opts)
                 add_tools_from_context_actions(tools, ctx.actions_for_available_tools())
-
-                # Add the tools from the action for this generation last so that
-                # they overwrite conflicting names.
                 add_tools_from_context_actions(tools, [action])
             MelleaLogger.get_logger().info(f"Tools for call: {tools.keys()}")
-        # Extract top-level Ollama params that must not be forwarded into `options`.
+
         logprobs = model_opts.pop("logprobs", None)
         top_logprobs = model_opts.pop("top_logprobs", None)
 
-        # Generate a chat response from ollama, using the chat messages. Can be either type since stream is passed as a model option.
         chat_response: Coroutine[
             Any, Any, AsyncIterator[ollama.ChatResponse] | ollama.ChatResponse
         ] = self._async_client.chat(
@@ -487,8 +921,6 @@ class OllamaModelBackend(FormatterBackend):
         output._call.action = action
         output._call.model_options = model_opts
 
-        # Processing functions only pass the ModelOutputThunk (and current chunk of response). Bind the other vars necessary for
-        # each processing step.
         output._gen.process = functools.partial(self.processing, tools=tools)
         output._gen.post_process = functools.partial(
             self.post_processing,
@@ -497,18 +929,10 @@ class OllamaModelBackend(FormatterBackend):
             _format=_format,
         )
 
-        # Set model/provider early so they are available in the error path
         output.generation.model = self._model_id
         output.generation.provider = self._provider
 
         try:
-            # To support lazy computation, will need to remove this create_task and store just the unexecuted coroutine.
-            # We can also support synchronous calls by adding a flag and changing this ._gen.generate function.
-
-            # This function should always be called from a running event loop so we don't have to worry about
-            # scheduling the task to a specific event loop here.
-
-            # Use `create_task` so that we don't have to specifically await this task before it starts executing.
             output._gen.generate = asyncio.create_task(
                 send_to_queue(
                     chat_response,
@@ -520,7 +944,6 @@ class OllamaModelBackend(FormatterBackend):
             )
             output._gen.generate_type = GenerateType.ASYNC
         except RuntimeError as e:
-            # Most likely cause is running this function without an event loop present
             raise e
 
         return output
@@ -579,10 +1002,6 @@ class OllamaModelBackend(FormatterBackend):
         await self.do_generate_walks(list(actions))
         prompts = [self.formatter.print(action) for action in actions]
 
-        # Ollama doesn't support "batching". There's some ability for concurrency. Use that here.
-        # See https://github.com/ollama/ollama/blob/main/docs/faq.md#how-does-ollama-handle-concurrent-requests.
-
-        # Run async so that we can make use of Ollama's concurrency.
         coroutines: list[Coroutine[Any, Any, ollama.GenerateResponse]] = []
         for prompt in prompts:
             co = self._async_client.generate(
@@ -595,8 +1014,6 @@ class OllamaModelBackend(FormatterBackend):
             )
             coroutines.append(co)
 
-        # All-or-nothing: first failure raises; remaining in-flight requests
-        # complete but their results are discarded.
         responses = await asyncio.gather(*coroutines)
 
         results = []
@@ -607,9 +1024,6 @@ class OllamaModelBackend(FormatterBackend):
             result = None
             per_mot_usage: dict[str, Any] | None = None
             if response.done and not response.response and not response.thinking:
-                # Empty done response with no thinking content. Commonly caused by the
-                # Ollama model-load race (#599) but can also occur on an early stop or
-                # stop-sequence hit.
                 empty_err = RuntimeError(
                     f"generate_from_raw: request {i} returned an empty response from Ollama "
                     "(response='', done=True). This commonly occurs when the model is still "
@@ -685,11 +1099,9 @@ class OllamaModelBackend(FormatterBackend):
                     MelleaLogger.get_logger().warning(
                         f"model attempted to call a non-existing function: {tool.function.name}"
                     )
-                    continue  # skip this function if we can't find it.
+                    continue
 
                 args = tool.function.arguments
-
-                # Validate and coerce argument types
                 validated_args = validate_tool_arguments(func, args, strict=False)
                 model_tool_calls[tool.function.name] = ModelToolCall(
                     tool.function.name, func, validated_args
@@ -731,15 +1143,11 @@ class OllamaModelBackend(FormatterBackend):
 
         tool_chunk = self._extract_model_tool_requests(tools, chunk)
         if tool_chunk is not None:
-            # Only set tool_calls if there is one.
             if mot.tool_calls is None:
                 mot.tool_calls = {}
-
-            # Merge the tool_chunk dict.
             for key, val in tool_chunk.items():
                 mot.tool_calls[key] = val
 
-        # Ollama responses are mostly self-contained. Merge chunks immediately.
         chat_response_delta_merge(mot, chunk)
 
     async def post_processing(
@@ -768,7 +1176,6 @@ class OllamaModelBackend(FormatterBackend):
             "ModelOutputThunks should have their model_opts assigned during generation"
         )
 
-        # Generate the log for this ModelOutputThunk.
         generate_log = GenerateLog()
         generate_log.prompt = conversation
         generate_log.backend = f"ollama::{self._model_id}"
@@ -788,14 +1195,12 @@ class OllamaModelBackend(FormatterBackend):
         mot._generate_log = generate_log
         mot._gen.generate = None
 
-        # Extract token counts from response
         response = mot.raw.response
         prompt_tokens = (
             getattr(response, "prompt_eval_count", None) if response else None
         )
         completion_tokens = getattr(response, "eval_count", None) if response else None
 
-        # Populate standardized usage field (convert to OpenAI format)
         if prompt_tokens is not None and completion_tokens is not None:
             mot.generation.usage = {
                 "prompt_tokens": prompt_tokens,
@@ -803,12 +1208,10 @@ class OllamaModelBackend(FormatterBackend):
                 "total_tokens": prompt_tokens + completion_tokens,
             }
 
-        # Populate model and provider metadata
         mot.generation.model = self._model_id
         mot.generation.provider = self._provider
         mot.raw.provider = self._provider
 
-        # Populate response-side metadata for telemetry
         if response is not None:
             mot.generation.response_model = getattr(response, "model", None)
             if done_reason := getattr(response, "done_reason", None):
@@ -824,7 +1227,7 @@ def chat_response_delta_merge(mot: ModelOutputThunk, delta: ollama.ChatResponse)
     """
     if mot.raw.response is None:
         mot.raw.response = delta
-        return  # Return early, no need to merge.
+        return
 
     merged: ollama.ChatResponse = mot.raw.response
     if not merged.done:
