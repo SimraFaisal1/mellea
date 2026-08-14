@@ -54,17 +54,33 @@ from .tools import add_tools_from_context_actions, add_tools_from_model_options,
 
 format: None = None  # typing this variable in order to shadow the global format function and ensure mypy checks for errors
 
-# [ADDED] Maps the mellea intrinsic catalog name to the conventional Ollama model
+# Maps the mellea intrinsic catalog name to the conventional Ollama model
 # name prefix used for the merged aLoRA/LoRA models distributed by IBM.
 # Tag suffix (e.g. ":8b") is derived automatically from the base model at runtime.
 # Users can override the full tag via add_adapter(..., ollama_model="...") when
 # their local Ollama naming differs from this convention.
-
-# TODO: add all other models here
+#
+# Entries are present only for intrinsics that IBM has published as pre-merged
+# Ollama models.  RAG and Guardian intrinsics are not yet published to Ollama
+# Hub, so they are absent here; add_adapter() will warn and fall back to the
+# base model for any intrinsic not listed.
 _INTRINSIC_OLLAMA_PREFIX: dict[str, str] = {
+    # Core intrinsics — available as standalone Ollama models.
     "uncertainty":          "granite-uncertainty",
     "requirement-check":    "granite-requirement-check",
-    "context-attribution":  "granite-context-attribution"
+    "context-attribution":  "granite-context-attribution",
+    # RAG intrinsics — no Ollama Hub model published yet.
+    # "answerability":       "granite-answerability",        # not yet on Ollama Hub
+    # "citations":           "granite-citations",            # not yet on Ollama Hub
+    # "context_relevance":   "granite-context-relevance",    # deprecated; Granite 4.0 only
+    # "hallucination_detection": "granite-hallucination",    # not yet on Ollama Hub
+    # "query_clarification": "granite-query-clarification",  # not yet on Ollama Hub
+    # "query_rewrite":       "granite-query-rewrite",        # not yet on Ollama Hub
+    # Guardian intrinsics — no Ollama Hub model published yet.
+    # "policy-guardrails":   "granite-policy-guardrails",    # not yet on Ollama Hub
+    # "guardian-core":       "granite-guardian",             # not yet on Ollama Hub
+    # "factuality-detection": "granite-factuality-detection",# not yet on Ollama Hub
+    # "factuality-correction": "granite-factuality-correction", # not yet on Ollama Hub
 }
 
 
@@ -231,7 +247,7 @@ class OllamaModelBackend(FormatterBackend, AdapterMixin):
             return self._model_id.split("/")[1]
         return self._model_id
 
-    def add_adapter(  # [CHANGED] added ollama_model kwarg
+    def add_adapter(
         self,
         adapter: IntrinsicAdapter,
         *,
@@ -285,9 +301,7 @@ class OllamaModelBackend(FormatterBackend, AdapterMixin):
         adapter.backend = self
         self._added_adapters[adapter.qualified_name] = adapter
 
-        # [ADDED] Resolve and store the Ollama model tag for this intrinsic.
         if ollama_model is not None:
-            # Caller supplied an explicit tag — trust it unconditionally.
             resolved = ollama_model
         else:
             # Auto-derive: prefix from the catalog map + size tag from self._model_id.
